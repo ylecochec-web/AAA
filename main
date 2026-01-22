@@ -1,0 +1,957 @@
+# ==============================================================================
+# PROJECT SOUTHERN LIFE - PORTFOLIO OPTIMIZATION ENGINE (v1.2 - COMPOSITION)
+# ==============================================================================
+#
+# UPDATES v1.2:
+# - Added "Portfolio Composition" View.
+# - Detailed line-by-line table with Subtotals and Grand Totals.
+# - Weighted average calculations for Yield, Drawdown, Rating, and Maturity.
+# - Aeon Styling applied to tabular data.
+# - Fixed column alignment for Subtotals/Totals.
+#
+# ==============================================================================
+
+import dash
+from dash import dcc, html
+from dash.dependencies import Input, Output, State, ALL, MATCH
+import plotly.graph_objs as go
+import plotly.express as px
+import pandas as pd
+import numpy as np
+import mosek
+import base64
+import math
+import time
+import socket
+import sys
+import os
+
+# ==========================================
+# 1. LOAD DATA & GLOBAL VARIABLES
+# ==========================================
+
+# Initialize Globals
+assets = []
+yields = []
+covid_drawdown_values = []
+rating_linear_scores = []
+maturities = [] 
+asset_classes_map = [] 
+unique_asset_classes = []
+BASE_ASSET_CHARACTERISTICS = {}
+
+# ALM Globals
+alm_profile = [] 
+
+GUIDELINE_LIMITS = {
+    "Asset Class": {"min": 0.0, "max": 1.0},
+    "Asset":       {"min": 0.0, "max": 1.0},
+    "Yield":       {"min": 0,   "max": 9999}
+}
+
+def load_and_validate_data():
+    global df_assets, df_guidelines, df_alm, assets, yields, covid_drawdown_values
+    global rating_linear_scores, asset_classes_map, unique_asset_classes, BASE_ASSET_CHARACTERISTICS
+    global maturities, alm_profile
+    
+    print("--- Loading Data v1.2 ---")
+
+    # 1. Load Asset & Guideline Files
+    if os.path.exists('asset_allocation_data.xlsx'):
+        df_assets = pd.read_excel('asset_allocation_data.xlsx', sheet_name='assets')
+        df_guidelines = pd.read_excel('asset_allocation_data.xlsx', sheet_name='guidelines')
+        try:
+            df_alm = pd.read_excel('asset_allocation_data.xlsx', sheet_name='ALM')
+        except:
+             df_alm = pd.read_csv('asset_allocation_data.xlsx - ALM.csv')
+
+    elif os.path.exists('asset_allocation_data.xlsx - assets.csv'):
+        df_assets = pd.read_csv('asset_allocation_data.xlsx - assets.csv')
+        df_guidelines = pd.read_csv('asset_allocation_data.xlsx - guidelines.csv')
+        df_alm = pd.read_csv('asset_allocation_data.xlsx - ALM.csv')
+    else:
+        print("CRITICAL ERROR: Data files not found.")
+        return False
+
+    # 2. Parse Guidelines
+    try:
+        for index, row in df_guidelines.iterrows():
+            g_name = row['Guideline']
+            if g_name in GUIDELINE_LIMITS:
+                GUIDELINE_LIMITS[g_name]['min'] = float(row['Min'])
+                GUIDELINE_LIMITS[g_name]['max'] = float(row['Max'])
+        print(f"Guidelines Active: {GUIDELINE_LIMITS}")
+    except Exception as e:
+        print(f"Warning parsing guidelines: {e}")
+
+    # 3. Parse ALM Profile
+    try:
+        alm_profile = df_alm[['Year', 'Liabilities']].to_dict('records')
+    except Exception as e:
+        print(f"CRITICAL ERROR loading ALM data: {e}")
+        return False
+
+    # 4. Clean Asset Data
+    if 'Maturity' not in df_assets.columns:
+        print("CRITICAL ERROR: 'Maturity' column missing in assets file.")
+        return False
+        
+    df_assets = df_assets.dropna(subset=['Asset', 'Yield (%)', 'Drawdown (%)', 'Rating Score', 'Asset Class', 'Maturity'])
+    
+    # 5. Populate Globals
+    assets = df_assets['Asset'].tolist()
+    asset_classes_map = df_assets['Asset Class'].tolist()
+    unique_asset_classes = sorted(list(set(asset_classes_map))) # Sorted for consistent table order
+    
+    yields = df_assets['Yield (%)'].astype(float).tolist()
+    covid_drawdown_values = df_assets['Drawdown (%)'].astype(float).tolist()
+    rating_linear_scores = df_assets['Rating Score'].astype(float).tolist()
+    maturities = df_assets['Maturity'].astype(float).tolist()
+
+    if len(assets) != len(yields):
+        print(f"CRITICAL ERROR: Length Mismatch!")
+        return False
+
+    BASE_ASSET_CHARACTERISTICS = {}
+    for index, row in df_assets.iterrows():
+        BASE_ASSET_CHARACTERISTICS[row['Asset']] = {
+            "yield_bps": int(row['Yield (%)'] * 100),          
+            "drawdown_bps": int(row['Drawdown (%)'] * 100),
+            "rating_score": row['Rating Score'],
+            "is_private": bool(row['Is Private']),
+            "asset_class": row['Asset Class'],
+            "maturity": row['Maturity']
+        }
+    
+    print(f"Assets Loaded: {len(assets)} (Verified Alignment)")
+    return True
+
+# Load Data Immediately
+if not load_and_validate_data():
+    sys.exit("Data load failed. Exiting.")
+
+# ==========================================
+# 2. THE SOLVER ENGINE
+# ==========================================
+
+def solve_asset_allocation_fast(env, covid_limit_exact, private_limit_exact):
+    num_assets = len(assets)
+    
+    # Guideline Inputs
+    asset_max_alloc = GUIDELINE_LIMITS['Asset']['max'] * 100 
+    class_max_alloc = GUIDELINE_LIMITS['Asset Class']['max'] * 100
+    yield_min_bps = GUIDELINE_LIMITS['Yield']['min']
+    yield_max_bps = GUIDELINE_LIMITS['Yield']['max']
+
+    with env.Task(0, 0) as task:
+        task.appendvars(num_assets)
+        
+        # 1. Variable Bounds
+        for j in range(num_assets):
+            task.putvarbound(j, mosek.boundkey.ra, 0.0, asset_max_alloc)
+        
+        # Objective: Maximize Yield
+        task.putobjsense(mosek.objsense.maximize)
+        for j in range(num_assets):
+            task.putcj(j, yields[j])
+        
+        # --- CONSTRAINTS ---
+        
+        # Constraint 0: Covid Drawdown (Equality)
+        task.appendcons(1)
+        for j in range(num_assets):
+            task.putaij(0, j, covid_drawdown_values[j])
+        task.putconbound(0, mosek.boundkey.fx, covid_limit_exact, covid_limit_exact)
+        
+        # Constraint 1: Private Allocation (Equality)
+        task.appendcons(1)
+        for j in range(num_assets):
+            if BASE_ASSET_CHARACTERISTICS[assets[j]]['is_private']:
+                task.putaij(1, j, 1.0)
+        task.putconbound(1, mosek.boundkey.fx, private_limit_exact, private_limit_exact)
+        
+        # Constraint 2: Sum 100%
+        task.appendcons(1)
+        for j in range(num_assets):
+            task.putaij(2, j, 1.0)
+        task.putconbound(2, mosek.boundkey.fx, 100.0, 100.0)
+
+        # Constraint 3: Yield Range
+        task.appendcons(1)
+        for j in range(num_assets):
+            task.putaij(3, j, yields[j])
+        task.putconbound(3, mosek.boundkey.ra, yield_min_bps, yield_max_bps)
+
+        # Constraint 4 to 4+N: Asset Class Constraints
+        current_cons_idx = 4
+        for cls_name in unique_asset_classes:
+            task.appendcons(1)
+            indices = [i for i, x in enumerate(asset_classes_map) if x == cls_name]
+            for idx in indices:
+                task.putaij(current_cons_idx, idx, 1.0)
+            task.putconbound(current_cons_idx, mosek.boundkey.up, 0.0, class_max_alloc)
+            current_cons_idx += 1
+            
+        # ALM CONSTRAINTS
+        for point in alm_profile:
+            t = point['Year']
+            target = point['Liabilities']
+            lb = target * 0.9
+            ub = target * 1.1
+            task.appendcons(1)
+            relevant_indices = [i for i, m in enumerate(maturities) if m >= t]
+            for idx in relevant_indices:
+                task.putaij(current_cons_idx, idx, 1.0)
+            task.putconbound(current_cons_idx, mosek.boundkey.ra, lb, ub)
+            current_cons_idx += 1
+
+        task.putintparam(mosek.iparam.log, 0)
+        task.optimize()
+        solsta = task.getsolsta(mosek.soltype.bas)
+        
+        if solsta == mosek.solsta.optimal:
+            x = [0.0] * num_assets
+            task.getsolutionslice(mosek.soltype.bas, mosek.solitem.xx, 0, num_assets, x)
+            total_yield = sum(x[j] * yields[j] for j in range(num_assets))
+            actual_covid = sum(x[j] * covid_drawdown_values[j] for j in range(num_assets))
+            return total_yield, x, actual_covid
+        else:
+            return None, None, None
+
+def get_rating(rating_linear_score):
+    if 0 <= rating_linear_score < 1.5:  return "AAA"
+    elif 1.5 <= rating_linear_score < 2.5: return "AA+"
+    elif 2.5 <= rating_linear_score < 3.5: return "AA"
+    elif 3.5 <= rating_linear_score < 4.5: return "AA-"
+    elif 4.5 <= rating_linear_score < 5.5: return "A+"
+    elif 5.5 <= rating_linear_score < 6.5: return "A"
+    elif 6.5 <= rating_linear_score < 7.5: return "A-"
+    elif 7.5 <= rating_linear_score < 8.5: return "BBB+"
+    elif 8.5 <= rating_linear_score < 9.5: return "BBB"
+    elif 9.5 <= rating_linear_score < 10.5: return "BBB-"
+    elif 10.5 <= rating_linear_score < 11.5: return "BB+"
+    elif 11.5 <= rating_linear_score < 12.5: return "BB"
+    elif 12.5 <= rating_linear_score < 13.5: return "BB-"
+    else: return "Unknown"
+
+# ==========================================
+# 3. VISUALIZATION STYLING
+# ==========================================
+
+AEON_DARK_BLUE = '#272E44'
+AEON_MEDIUM_BLUE = '#3E4C6E'
+AEON_SLATE_BLUE = '#586D8A'
+AEON_LIGHT_BLUE = '#6376A7'
+AEON_GREY = '#A6A6A6'
+AEON_WHITE = '#FFFFFF'
+SANDSTONE_COLOR = '#C3BBAF'
+
+A_RATINGS = ["AAA", "AA+", "AA", "AA-", "A+", "A", "A-"]
+BBB_RATINGS = ["BBB+", "BBB", "BBB-"]
+BB_RATINGS = ["BB+", "BB", "BB-"]
+UNKNOWN_RATING = ["Unknown"]
+CANONICAL_RATING_ORDER = A_RATINGS + BBB_RATINGS + BB_RATINGS + UNKNOWN_RATING
+
+def generate_sample_points(n_colors, start=0.0, end=1.0):
+    if n_colors <= 0: return []
+    if n_colors == 1: return [(start + end) / 2]
+    points = [start + (end - start) * i / (n_colors - 1) for i in range(n_colors)]
+    return [max(0.0, min(1.0, p)) for p in points]
+
+a_colors = px.colors.sample_colorscale("Greens", generate_sample_points(len(A_RATINGS), 0.2, 1.0))
+bbb_colors = px.colors.sample_colorscale("Blues", generate_sample_points(len(BBB_RATINGS)-1, 0.6, 1.0))
+bb_col = px.colors.sample_colorscale("YlOrBr", [0.5])[0]
+
+final_grouped_rating_color_map_v45 = {}
+for i, r in enumerate(A_RATINGS):
+    final_grouped_rating_color_map_v45[r] = a_colors[i]
+final_grouped_rating_color_map_v45["BBB+"] = AEON_DARK_BLUE
+final_grouped_rating_color_map_v45["BBB"] = AEON_MEDIUM_BLUE
+final_grouped_rating_color_map_v45["BBB-"] = bbb_colors[0] if bbb_colors else AEON_LIGHT_BLUE
+final_grouped_rating_color_map_v45["BB+"] = SANDSTONE_COLOR
+final_grouped_rating_color_map_v45["BB"] = bb_col
+final_grouped_rating_color_map_v45["BB-"] = SANDSTONE_COLOR
+final_grouped_rating_color_map_v45["Unknown"] = AEON_GREY
+
+DEFAULT_COLUMNS = ['covid_limit', 'total_yield_bps', 'rating_str', 'private_limit', 'color', 'allocation', 'actual_covid_drawdown']
+
+YIELD_RANGES = [(0, 200, "<200"), (200, 400, "200-400"), (400, 600, "400-600"), (600, 800, "600-800"), (800, 1000, "800-1000"), (1000, None, ">1000")]
+DRAWDOWN_RANGES = [(0, 250, "<250"), (250, 400, "250-400"), (400, 600, "400-600"), (600, 800, "600-800"), (800, 1000, "800-1000"), (1000, None, ">1000")]
+YIELD_COLORS = ['#A3D900', '#D9BF00', '#D99800', '#D97300', '#D94D00', '#D90000']
+DRAWDOWN_COLORS = ['#0077B6', '#0096C7', '#00B4D8', '#48CAE4', '#90E0EF', '#ADE8F4']
+
+RATING_GROUPS = {"A_RATINGS": A_RATINGS, "BBB_RATINGS": BBB_RATINGS, "BB_RATINGS": BB_RATINGS, "UNKNOWN_RATING": ["Unknown"]}
+RATING_GROUP_COLORS = {"A_RATINGS": '#4CAF50', "BBB_RATINGS": '#2196F3', "BB_RATINGS": '#FF9800', "UNKNOWN_RATING": AEON_GREY}
+PRIVATE_PUBLIC_COLORS = {"Private Assets": '#800080', "Public Assets": '#C6A9C6'}
+
+NEW_COLUMN_CONFIG = [
+    {"id": "asset_allocation", "title": "Asset Class Allocation", "type": "asset_class_pie"},
+    {"id": "yield_grouping", "title": "Yield Distribution", "type": "grouped_pie", "metric_char_key": "yield_bps", "ranges": YIELD_RANGES, "colors": YIELD_COLORS},
+    {"id": "drawdown_grouping", "title": "Drawdown Distribution", "type": "grouped_pie", "metric_char_key": "drawdown_bps", "ranges": DRAWDOWN_RANGES, "colors": DRAWDOWN_COLORS},
+    {"id": "private_public", "title": "Private vs Public", "type": "custom_pie", "breakdown_type": "private_public"},
+    {"id": "rating_grouping", "title": "Rating Group", "type": "custom_pie", "breakdown_type": "rating_group"}
+]
+
+# ==========================================
+# 4. DATA GENERATOR
+# ==========================================
+
+def calculate_grid_data():
+    data_points = []
+    
+    asset_lim = GUIDELINE_LIMITS['Asset']['max'] * 100
+    class_lim = GUIDELINE_LIMITS['Asset Class']['max'] * 100
+    
+    print(f"Starting Solver v1.2: Asset Cap {asset_lim}%, Class Cap {class_lim}%...")
+    start_time = time.time()
+    
+    with mosek.Env() as env:
+        for covid_limit in range(0, 2001, 25): 
+            for private_limit in range(0, 101, 10): 
+                res = solve_asset_allocation_fast(env, covid_limit, private_limit)
+                if res[0] is not None:
+                    total_yield, x, actual_covid = res
+                    w_score = sum(x[j] * rating_linear_scores[j] for j in range(len(x)))
+                    rating_str = get_rating(w_score / 100)
+                    data_points.append({
+                        "covid_limit": covid_limit,
+                        "total_yield_bps": total_yield, 
+                        "rating_str": rating_str,
+                        "private_limit": private_limit, 
+                        "color": final_grouped_rating_color_map_v45.get(rating_str, AEON_GREY),
+                        "allocation": x,
+                        "actual_covid_drawdown": actual_covid
+                    })
+    
+    print(f"Solver Finished: {len(data_points)} feasible points in {time.time() - start_time:.2f}s.")
+    return data_points
+
+initial_data = calculate_grid_data() 
+
+# ==========================================
+# 5. HELPER FUNCTIONS
+# ==========================================
+
+def score_to_rating(score): return get_rating(score)
+
+def get_marks(min_val, max_val, num_marks=6, is_bps=False):
+    min_val = float(min_val); max_val = float(max_val)
+    if max_val <= min_val: return {int(min_val): str(int(min_val))}
+    step = (max_val - min_val) / (num_marks - 1)
+    marks = {}
+    for i in range(num_marks):
+        val = min_val + (i * step)
+        marks[int(val)] = str(int(val))
+    return marks
+
+def make_tuple_hashable(data_tuple):
+    if not isinstance(data_tuple, tuple): data_tuple = tuple(data_tuple)
+    temp = list(data_tuple)
+    if len(temp) > 5 and isinstance(temp[5], list): temp[5] = tuple(temp[5])
+    return tuple(temp)
+
+def ensure_dict_format(data):
+    if isinstance(data, dict): return data
+    return {"Current": None, "Switch 1": None, "Switch 2": None}
+
+def get_rating_group(rating_str):
+    for group, ratings in RATING_GROUPS.items():
+        if rating_str in ratings: return group
+    return "UNKNOWN_RATING"
+
+def create_pie_figure(labels, values, colors, title, height):
+    fig = go.Figure()
+    if not values or all(v < 1e-6 for v in values):
+        fig.add_annotation(text="No Data", x=0.5, y=0.5, font_size=16, showarrow=False)
+    else:
+        fig.add_trace(go.Pie(
+            labels=labels, values=values,
+            marker=dict(colors=colors, line=dict(width=1, color=AEON_WHITE)),
+            texttemplate='%{label}<br>%{percent:.0%}', hoverinfo='label+percent+value',
+            sort=False, direction='clockwise'
+        ))
+    
+    fig.update_layout(
+        showlegend=False, margin=dict(l=10, r=10, t=30, b=10), height=height,
+        font=dict(family='"Bierstadt", "Segoe UI"'), paper_bgcolor='rgba(0,0,0,0)',
+        title=dict(text=title, y=0.98, x=0.5, xanchor='center', yanchor='top', font=dict(size=14, color='black'))
+    )
+    return fig
+
+def calculate_portfolio_alm_curve(allocation):
+    curve_x = [p['Year'] for p in alm_profile]
+    curve_y = []
+    for t in curve_x:
+        val = sum(allocation[i] for i, m in enumerate(maturities) if m >= t)
+        curve_y.append(val)
+    return curve_x, curve_y
+
+# --- v1.2 NEW HELPER: TABLE GENERATOR ---
+def generate_portfolio_composition_table(title, allocation_list):
+    # Header Row (7 Columns total)
+    header = html.Tr([
+        html.Th("Allocation", style={'backgroundColor': AEON_DARK_BLUE, 'color': 'white', 'padding': '8px', 'textAlign': 'right', 'width': '10%'}),
+        html.Th("Asset Class", style={'backgroundColor': AEON_DARK_BLUE, 'color': 'white', 'padding': '8px', 'textAlign': 'left', 'width': '20%'}),
+        html.Th("Asset Name", style={'backgroundColor': AEON_DARK_BLUE, 'color': 'white', 'padding': '8px', 'textAlign': 'left', 'width': '30%'}),
+        html.Th("Yield", style={'backgroundColor': AEON_DARK_BLUE, 'color': 'white', 'padding': '8px', 'textAlign': 'right', 'width': '10%'}),
+        html.Th("DD", style={'backgroundColor': AEON_DARK_BLUE, 'color': 'white', 'padding': '8px', 'textAlign': 'right', 'width': '10%'}),
+        html.Th("Rating", style={'backgroundColor': AEON_DARK_BLUE, 'color': 'white', 'padding': '8px', 'textAlign': 'center', 'width': '10%'}),
+        html.Th("Mat", style={'backgroundColor': AEON_DARK_BLUE, 'color': 'white', 'padding': '8px', 'textAlign': 'right', 'width': '10%'}),
+    ])
+    
+    rows = [header]
+    
+    if not allocation_list:
+        allocation_list = [0.0] * len(assets)
+        
+    grand_total_alloc = 0
+    grand_total_yield_prod = 0
+    grand_total_dd_prod = 0
+    grand_total_rating_prod = 0
+    grand_total_mat_prod = 0
+    
+    # Iterate by Asset Class
+    for ac_class in unique_asset_classes:
+        # Get indices for this class
+        indices = [i for i, x in enumerate(asset_classes_map) if x == ac_class]
+        
+        # Subtotal Variables
+        sub_alloc = 0
+        sub_yield_prod = 0
+        sub_dd_prod = 0
+        sub_rating_prod = 0
+        sub_mat_prod = 0
+        
+        # Add Rows for Assets
+        for idx in indices:
+            alloc = allocation_list[idx]
+            yld = yields[idx]
+            dd = covid_drawdown_values[idx]
+            rating_sc = rating_linear_scores[idx]
+            mat = maturities[idx]
+            asset_name = assets[idx]
+            rating_txt = get_rating(rating_sc)
+            
+            # Accumulate Subtotals
+            sub_alloc += alloc
+            sub_yield_prod += alloc * yld
+            sub_dd_prod += alloc * dd
+            sub_rating_prod += alloc * rating_sc
+            sub_mat_prod += alloc * mat
+            
+            # Row Styling
+            bg_color = 'white'
+            
+            rows.append(html.Tr([
+                html.Td(f"{alloc:.2f}%", style={'padding': '5px', 'borderBottom': '1px solid #eee', 'textAlign': 'right', 'backgroundColor': bg_color}),
+                html.Td(ac_class, style={'padding': '5px', 'borderBottom': '1px solid #eee', 'backgroundColor': bg_color}),
+                html.Td(asset_name, style={'padding': '5px', 'borderBottom': '1px solid #eee', 'backgroundColor': bg_color}),
+                html.Td(f"{yld:.2f}%", style={'padding': '5px', 'borderBottom': '1px solid #eee', 'textAlign': 'right', 'backgroundColor': bg_color}),
+                html.Td(f"{dd:.2f}%", style={'padding': '5px', 'borderBottom': '1px solid #eee', 'textAlign': 'right', 'backgroundColor': bg_color}),
+                html.Td(rating_txt, style={'padding': '5px', 'borderBottom': '1px solid #eee', 'textAlign': 'center', 'backgroundColor': bg_color}),
+                html.Td(f"{mat:.1f}", style={'padding': '5px', 'borderBottom': '1px solid #eee', 'textAlign': 'right', 'backgroundColor': bg_color}),
+            ]))
+            
+        # Add Subtotal Row
+        # Calc weighted averages
+        w_yield = sub_yield_prod / sub_alloc if sub_alloc > 0 else 0
+        w_dd = sub_dd_prod / sub_alloc if sub_alloc > 0 else 0
+        w_rating = get_rating(sub_rating_prod / sub_alloc) if sub_alloc > 0 else "-"
+        w_mat = sub_mat_prod / sub_alloc if sub_alloc > 0 else 0
+        
+        # Accumulate Grand Totals
+        grand_total_alloc += sub_alloc
+        grand_total_yield_prod += sub_yield_prod
+        grand_total_dd_prod += sub_dd_prod
+        grand_total_rating_prod += sub_rating_prod
+        grand_total_mat_prod += sub_mat_prod
+        
+        # Subtotal uses colSpan=2 for the Label to span "Asset Class" and "Asset Name" columns
+        # This keeps the metrics (Yield, DD, Rating, Mat) in the correct column indices (3, 4, 5, 6)
+        rows.append(html.Tr([
+            html.Td(f"{sub_alloc:.2f}%", style={'padding': '5px', 'backgroundColor': '#f0f0f0', 'fontWeight': 'bold', 'textAlign': 'right'}),
+            html.Td(f"Total {ac_class}", colSpan=2, style={'padding': '5px', 'backgroundColor': '#f0f0f0', 'fontWeight': 'bold', 'textAlign': 'left'}),
+            html.Td(f"{w_yield:.2f}%", style={'padding': '5px', 'backgroundColor': '#f0f0f0', 'fontWeight': 'bold', 'textAlign': 'right'}),
+            html.Td(f"{w_dd:.2f}%", style={'padding': '5px', 'backgroundColor': '#f0f0f0', 'fontWeight': 'bold', 'textAlign': 'right'}),
+            html.Td(w_rating, style={'padding': '5px', 'backgroundColor': '#f0f0f0', 'fontWeight': 'bold', 'textAlign': 'center'}),
+            html.Td(f"{w_mat:.1f}", style={'padding': '5px', 'backgroundColor': '#f0f0f0', 'fontWeight': 'bold', 'textAlign': 'right'}),
+        ]))
+
+    # Grand Total Calculation
+    gt_yield = grand_total_yield_prod / grand_total_alloc if grand_total_alloc > 0 else 0
+    gt_dd = grand_total_dd_prod / grand_total_alloc if grand_total_alloc > 0 else 0
+    gt_rating = get_rating(grand_total_rating_prod / grand_total_alloc) if grand_total_alloc > 0 else "-"
+    gt_mat = grand_total_mat_prod / grand_total_alloc if grand_total_alloc > 0 else 0
+    
+    rows.append(html.Tr([
+        html.Td(f"{grand_total_alloc:.2f}%", style={'padding': '8px', 'backgroundColor': AEON_DARK_BLUE, 'color': 'white', 'fontWeight': 'bold', 'textAlign': 'right'}),
+        html.Td("GRAND TOTAL", colSpan=2, style={'padding': '8px', 'backgroundColor': AEON_DARK_BLUE, 'color': 'white', 'fontWeight': 'bold', 'textAlign': 'left'}),
+        html.Td(f"{gt_yield:.2f}%", style={'padding': '8px', 'backgroundColor': AEON_DARK_BLUE, 'color': 'white', 'fontWeight': 'bold', 'textAlign': 'right'}),
+        html.Td(f"{gt_dd:.2f}%", style={'padding': '8px', 'backgroundColor': AEON_DARK_BLUE, 'color': 'white', 'fontWeight': 'bold', 'textAlign': 'right'}),
+        html.Td(gt_rating, style={'padding': '8px', 'backgroundColor': AEON_DARK_BLUE, 'color': 'white', 'fontWeight': 'bold', 'textAlign': 'center'}),
+        html.Td(f"{gt_mat:.1f}", style={'padding': '8px', 'backgroundColor': AEON_DARK_BLUE, 'color': 'white', 'fontWeight': 'bold', 'textAlign': 'right'}),
+    ]))
+
+    return html.Table(rows, style={'width': '100%', 'borderCollapse': 'collapse', 'fontFamily': '"Bierstadt", sans-serif', 'fontSize': '12px', 'tableLayout': 'fixed'})
+
+# ==========================================
+# 6. APP LAYOUT
+# ==========================================
+
+try:
+    logo_b64 = base64.b64encode(open('Aeon_Logo.png', 'rb').read()).decode()
+    aeon_logo_img = html.Img(src=f'data:image/png;base64,{logo_b64}', style={'height': '50px', 'position': 'absolute', 'top': '10px', 'right': '10px', 'zIndex': 1001})
+except: aeon_logo_img = html.Div()
+
+app = dash.Dash(__name__, suppress_callback_exceptions=True)
+server = app.server
+slot_keys = ["Current", "Switch 1", "Switch 2"]
+initial_selected_points = {k: None for k in slot_keys}
+
+BASE_CHAR_BPS = {}
+for k, v in BASE_ASSET_CHARACTERISTICS.items():
+    BASE_CHAR_BPS[k] = v.copy()
+
+client_portfolio_input_group = html.Div([
+    html.H4("Define Your Current Portfolio", style={'marginTop': '20px', 'marginBottom': '10px'}),
+    html.Div([dcc.Input(id={'type': 'client-alloc-input', 'index': ac}, type='number', min=0, max=100, step=1, placeholder=f"{ac} %", style={'width': '120px', 'marginRight': '10px', 'marginBottom': '5px'}) for ac in assets]),
+    html.Div(id='client-alloc-sum-display', style={'marginTop': '5px', 'marginBottom': '5px', 'minHeight': '20px'}),
+    html.Button('Update Current Portfolio', id='update-client-portfolio-btn', n_clicks=0, style={'backgroundColor': AEON_LIGHT_BLUE, 'color': AEON_WHITE, 'padding': '8px 12px', 'border': 'none', 'borderRadius': '4px', 'cursor': 'pointer'}),
+    html.Div(id='client-portfolio-status-message', style={'marginTop': '10px', 'color': AEON_DARK_BLUE}),
+    html.Hr(style={'marginTop': '20px'})
+])
+
+app.layout = html.Div([
+    dcc.Store(id='control-open-store', data=False),
+    dcc.Store(id='is-3d-view-store', data=False),
+    dcc.Store(id='selected-points-store', data=initial_selected_points, storage_type='local'),
+    dcc.Store(id='current-view-store', data='cloud'),
+    dcc.Store(id='active-reassign-slot-store', data=None),
+    dcc.Store(id='main-data-store', data=initial_data),
+    html.Div(id='page-content'),
+    html.Button('☰ Controls', id='toggle-control-btn', n_clicks=0, style={'position': 'fixed', 'top': '10px', 'left': '10px', 'zIndex': 1005, 'backgroundColor': AEON_MEDIUM_BLUE, 'color': AEON_WHITE, 'border': 'none', 'padding': '10px 15px', 'borderRadius': '4px', 'cursor': 'pointer'}),
+    aeon_logo_img,
+    html.Div([
+        html.H2("Control Dashboard", style={'textAlign': 'center'}), html.Hr(),
+        
+        # Guidelines Display
+        html.Label("1. Guidelines (Active):", style={'fontWeight': 'bold', 'color': 'red'}),
+        html.Div([
+            html.P(f"Asset Cap: {GUIDELINE_LIMITS['Asset']['max']*100:.0f}%"),
+            html.P(f"Class Cap: {GUIDELINE_LIMITS['Asset Class']['max']*100:.0f}%"),
+            html.P(f"Yield Range: {GUIDELINE_LIMITS['Yield']['min']} - {GUIDELINE_LIMITS['Yield']['max']} bps"),
+            html.P(f"ALM LDI: Active (+/- 10% Funnel)", style={'color': 'green', 'fontWeight': 'bold'}),
+            html.Button('Refresh Solver', id='recalc-btn', n_clicks=0, style={'marginTop': '5px', 'backgroundColor': 'green', 'color': 'white', 'padding': '5px 10px', 'border': 'none', 'borderRadius': '4px', 'cursor': 'pointer'}),
+        ], style={'marginBottom': '10px', 'padding': '10px', 'backgroundColor': '#e8e8e8', 'borderRadius': '5px'}),
+        
+        html.Div(id='recalc-status', style={'fontSize': '0.9em', 'color': 'blue', 'marginBottom': '20px'}),
+        html.Hr(),
+        html.Label("2. Filter Results:", style={'fontWeight': 'bold'}),
+        html.Label("Covid Drawdown Limit:"),
+        dcc.RangeSlider(id='covid-limit-range-slider', min=0, max=1000, value=[0, 1000], marks=get_marks(0, 1000, 5)), html.Br(),
+        html.Label("Private Asset Limit (%):"),
+        dcc.RangeSlider(id='private-limit-range-slider', min=0, max=100, value=[0, 100], marks=get_marks(0, 100, 5)), html.Br(),
+        html.Label("Total Yield (bps):"),
+        dcc.RangeSlider(id='yield-range-slider', min=0, max=1200, value=[0, 1200], marks=get_marks(0, 1200, 5, True)), html.Br(),
+        html.Label("Filter by Rating:", style={'fontWeight': 'bold'}),
+        dcc.Checklist(id='rating-filter', options=[{'label': r, 'value': r} for r in CANONICAL_RATING_ORDER], value=CANONICAL_RATING_ORDER, labelStyle={'display': 'inline-block', 'marginRight': '10px'}), html.Br(), html.Hr(),
+        client_portfolio_input_group,
+        html.Button('Randomly Select 3 Points', id='random-select-btn', n_clicks=0, style={'backgroundColor': AEON_LIGHT_BLUE, 'color': AEON_WHITE, 'padding': '10px', 'border': 'none', 'borderRadius': '4px', 'cursor': 'pointer', 'width': '100%', 'marginBottom': '10px'}),
+        html.Button('Switch Graph View', id='toggle-2d-3d-btn', n_clicks=0, style={'backgroundColor': AEON_LIGHT_BLUE, 'color': AEON_WHITE, 'padding': '10px', 'border': 'none', 'borderRadius': '4px', 'cursor': 'pointer', 'width': '100%', 'marginBottom': '10px'}),
+        html.Button('View Comparison Details', id='view-details-btn', n_clicks=0, disabled=True, style={'backgroundColor': AEON_LIGHT_BLUE, 'color': AEON_WHITE, 'padding': '10px', 'border': 'none', 'borderRadius': '4px', 'cursor': 'pointer', 'width': '100%', 'marginBottom': '10px'}),
+        html.Button('View ALM LDI Analysis', id='view-alm-btn', n_clicks=0, style={'backgroundColor': AEON_LIGHT_BLUE, 'color': AEON_WHITE, 'padding': '10px', 'border': 'none', 'borderRadius': '4px', 'cursor': 'pointer', 'width': '100%', 'marginBottom': '10px'}),
+        # v1.2 New Button
+        html.Button('Portfolio Composition', id='view-comp-btn', n_clicks=0, style={'backgroundColor': AEON_DARK_BLUE, 'color': AEON_WHITE, 'padding': '10px', 'border': 'none', 'borderRadius': '4px', 'cursor': 'pointer', 'width': '100%'}),
+        
+        html.Div(children=[html.P("Click selected point to 'arm', then click new point.", style={'fontSize':'0.9em'})], style={'marginBottom': '20px'}),
+    ], id='control-panel-div', style={'position': 'fixed', 'top': '0px', 'left': '-320px', 'width': '300px', 'height': '100vh', 'backgroundColor': '#f8f8f8', 'padding': '20px', 'boxShadow': '2px 0 5px rgba(0,0,0,0.1)', 'overflowY': 'auto', 'transition': 'left 0.3s ease-in-out', 'zIndex': 1000, 'color': AEON_DARK_BLUE}),
+], style={'fontFamily': '"Bierstadt", "Segoe UI", Arial, sans-serif', 'backgroundColor': AEON_WHITE, 'height': '100vh', 'width': '100vw', 'overflow': 'hidden'})
+
+def create_layout_screen1():
+    return html.Div([dcc.Graph(id='allocation-graph', style={'height': '100vh', 'width': '100vw'}, config={'displaylogo': False})], style={'height': '100vh', 'width': '100vw', 'overflow': 'hidden'})
+
+def create_layout_screen2():
+    element_content_height_px = 300
+    element_margin_bottom_px = '10px'
+    header_padding, header_font_size_approx = 10, 20
+    header_height_px = header_padding * 2 + header_font_size_approx + 10
+    row_title_boxes = [html.Div(html.H3(slot_name, style={'margin': 0}), style={'backgroundColor': AEON_DARK_BLUE, 'color': AEON_WHITE, 'padding': '10px', 'borderRadius': '5px', 'textAlign': 'center', 'fontWeight': 'bold', 'marginBottom': element_margin_bottom_px, 'height': f'{element_content_height_px}px', 'boxSizing': 'border-box', 'display': 'flex', 'alignItems': 'center', 'justifyContent': 'center'}) for slot_name in slot_keys]
+    col_header_boxes = [html.Div(html.H3(config['title'], style={'margin': 0}), style={'backgroundColor': AEON_MEDIUM_BLUE, 'color': AEON_WHITE, 'padding': '10px', 'borderRadius': '5px', 'textAlign': 'center', 'fontWeight': 'bold', 'width': '100%'}) for config in NEW_COLUMN_CONFIG]
+    grid_sections = []
+    for col_idx, config in enumerate(NEW_COLUMN_CONFIG):
+        section = html.Div(style={'width': f'{(100 / len(NEW_COLUMN_CONFIG)) - 1}%', 'display': 'flex', 'flexDirection': 'column', 'padding': '0 5px'}, children=[
+            col_header_boxes[col_idx],
+            html.Div(id=f'comparison-column-{config["id"]}', style={'paddingTop': f'{element_margin_bottom_px}'})
+        ])
+        grid_sections.append(section)
+    table_section = html.Div([
+        html.Div([html.H4("Compare Selected Points:", style={'margin': 0}), html.Button('Clear Selection', id='clear-selection-btn-s2', n_clicks=0, style={'marginLeft': '10px', 'height': '30px', 'padding': '5px 10px', 'backgroundColor': AEON_GREY, 'color': AEON_DARK_BLUE, 'border': f'1px solid {AEON_DARK_BLUE}', 'borderRadius': '4px'})], style={'display': 'flex', 'justifyContent': 'center', 'alignItems': 'center', 'marginBottom': element_margin_bottom_px, 'color': AEON_DARK_BLUE}),
+        html.Div(id='sidebar-comparison-table-div')
+    ], style={'width': '95%', 'margin': '20px auto', 'padding': '10px', 'border': f'1px solid {AEON_GREY}', 'borderRadius': '5px'})
+    return html.Div([
+        html.Button('Back to Cloud View', id='back-to-cloud-btn-s2', n_clicks=0, style={'position': 'absolute', 'top': '20px', 'left': '20px', 'zIndex': 10, 'padding': '10px 15px', 'backgroundColor': AEON_MEDIUM_BLUE, 'color': AEON_WHITE, 'border': 'none', 'borderRadius': '4px', 'cursor': 'pointer'}),
+        html.Div([
+            html.Div(children=row_title_boxes, style={'width': '10%', 'paddingRight': '10px', 'display': 'flex', 'flexDirection': 'column', 'justifyContent': 'flex-start', 'paddingTop': f'{header_height_px}px'}),
+            html.Div(style={'width': '90%', 'display': 'flex', 'flexDirection': 'row', 'paddingTop': '10px'}, children=grid_sections)
+        ], className='row', style={'display': 'flex', 'flexDirection': 'row', 'width': '95%', 'margin': '30px auto 20px auto', 'paddingTop': '50px'}),
+        table_section
+    ], style={'height': '100vh', 'width': '100vw', 'overflowY': 'auto', 'backgroundColor': '#f0f2f5', 'padding': '20px', 'paddingTop': '10px', 'color': AEON_DARK_BLUE})
+
+def create_layout_alm():
+    return html.Div([
+        html.Button('Back to Cloud View', id='back-to-cloud-btn-alm', n_clicks=0, style={'position': 'absolute', 'top': '20px', 'left': '20px', 'zIndex': 10, 'padding': '10px 15px', 'backgroundColor': AEON_MEDIUM_BLUE, 'color': AEON_WHITE, 'border': 'none', 'borderRadius': '4px', 'cursor': 'pointer'}),
+        html.H2("ALM Liability Driven Investment Analysis", style={'textAlign':'center', 'marginTop':'20px', 'color': AEON_DARK_BLUE}),
+        html.Div([
+            dcc.Graph(id='alm-graph', style={'height': '80vh', 'width': '90vw'})
+        ], style={'display': 'flex', 'justifyContent': 'center'})
+    ], style={'height': '100vh', 'width': '100vw', 'backgroundColor': '#f0f2f5'})
+
+# v1.2 NEW LAYOUT: PORTFOLIO COMPOSITION
+def create_layout_composition():
+    return html.Div([
+        html.Button('Back to Cloud View', id='back-to-cloud-btn-comp', n_clicks=0, style={'position': 'absolute', 'top': '20px', 'left': '20px', 'zIndex': 10, 'padding': '10px 15px', 'backgroundColor': AEON_MEDIUM_BLUE, 'color': AEON_WHITE, 'border': 'none', 'borderRadius': '4px', 'cursor': 'pointer'}),
+        html.H2("Portfolio Composition & Line-by-Line Analysis", style={'textAlign':'center', 'marginTop':'20px', 'color': AEON_DARK_BLUE}),
+        html.Div(id='composition-container', style={'display': 'flex', 'flexDirection': 'row', 'justifyContent': 'space-around', 'padding': '20px', 'height': '85vh'})
+    ], style={'height': '100vh', 'width': '100vw', 'backgroundColor': '#f0f2f5', 'overflowY': 'auto'})
+
+# ==========================================
+# 7. CALLBACKS
+# ==========================================
+
+@app.callback(Output('page-content', 'children'), Input('current-view-store', 'data'))
+def display_page(view):
+    if view == 'details': return create_layout_screen2()
+    if view == 'alm': return create_layout_alm()
+    if view == 'comp': return create_layout_composition() # v1.2
+    return create_layout_screen1()
+
+@app.callback(Output('control-panel-div', 'style'), Input('toggle-control-btn', 'n_clicks'), State('control-open-store', 'data'), State('control-panel-div', 'style'))
+def toggle_controls(n, is_open, style):
+    if dash.callback_context.triggered_id == 'toggle-control-btn': is_open = not is_open
+    style['left'] = '0px' if is_open else '-320px'
+    return style
+
+@app.callback(Output('control-open-store', 'data'), Input('toggle-control-btn', 'n_clicks'), State('control-open-store', 'data'))
+def update_control_store(n, is_open): return not is_open if n > 0 else is_open
+
+@app.callback(Output('view-details-btn', 'disabled'), Input('selected-points-store', 'data'))
+def set_view_details_button_state(data): return not any(ensure_dict_format(data).values())
+
+@app.callback(Output('current-view-store', 'data', allow_duplicate=True), Input('view-details-btn', 'n_clicks'), State('selected-points-store', 'data'), prevent_initial_call=True)
+def navigate_to_details_view(n, data):
+    if n > 0 and any(ensure_dict_format(data).values()): return 'details'
+    return dash.no_update
+
+@app.callback(Output('current-view-store', 'data', allow_duplicate=True), Input('view-alm-btn', 'n_clicks'), prevent_initial_call=True)
+def navigate_to_alm_view(n):
+    return 'alm'
+
+# v1.2 Navigate to Composition
+@app.callback(Output('current-view-store', 'data', allow_duplicate=True), Input('view-comp-btn', 'n_clicks'), prevent_initial_call=True)
+def navigate_to_comp_view(n):
+    return 'comp'
+
+@app.callback(Output('current-view-store', 'data', allow_duplicate=True), 
+              [Input('back-to-cloud-btn-s2', 'n_clicks'), 
+               Input('back-to-cloud-btn-alm', 'n_clicks'),
+               Input('back-to-cloud-btn-comp', 'n_clicks')], prevent_initial_call=True)
+def switch_back_to_cloud(n1, n2, n3): return 'cloud'
+
+@app.callback([Output('is-3d-view-store', 'data'), Output('toggle-2d-3d-btn', 'children')], Input('toggle-2d-3d-btn', 'n_clicks'), State('is-3d-view-store', 'data'))
+def toggle_view(n, is_3d):
+    new_is_3d = not is_3d if dash.callback_context.triggered_id else is_3d
+    return new_is_3d, "Switch to 2D View" if new_is_3d else "Switch to 3D View"
+
+@app.callback([Output('main-data-store', 'data'), Output('recalc-status', 'children')], [Input('recalc-btn', 'n_clicks')])
+def run_recalc(n):
+    data = calculate_grid_data()
+    if not data: return dash.no_update, "Error: Guidelines Too Strict (No Feasible Points)."
+    return data, f"Updated: {len(data)} pts (Excel Guidelines)"
+
+@app.callback(Output('selected-points-store', 'data'), Input('random-select-btn', 'n_clicks'), [State('covid-limit-range-slider','value'), State('private-limit-range-slider','value'), State('yield-range-slider','value'), State('rating-filter','value'), State('selected-points-store','data'), State('main-data-store', 'data')], prevent_initial_call=True)
+def randomly_select_points(n_clicks, covid_range, private_range, yield_range_bps, ratings, store, data_points):
+    if not data_points: return dash.no_update
+    df = pd.DataFrame(data_points)
+    df = df[df['covid_limit'].between(covid_range[0], covid_range[1])]
+    df = df[df['private_limit'].between(private_range[0], private_range[1])]
+    df = df[df['total_yield_bps'].between(yield_range_bps[0], yield_range_bps[1])]
+    if ratings: df = df[df['rating_str'].isin(ratings)]
+    if df.empty: return store
+    samp = df.sample(n=min(3, len(df)))
+    d = ensure_dict_format(store)
+    keys = ["Current", "Switch 1", "Switch 2"]
+    for i, (_, row) in enumerate(samp.iterrows()):
+        d[keys[i]] = make_tuple_hashable(tuple(row[DEFAULT_COLUMNS]))
+    return d
+
+@app.callback(Output('client-alloc-sum-display', 'children'), Input({'type': 'client-alloc-input', 'index': ALL}, 'value'))
+def update_allocation_sum(allocations):
+    total = sum([float(a) if a else 0 for a in allocations])
+    return html.Span(f"Total Allocation: {total:.1f}%", style={'color': 'green' if math.isclose(total, 100.0) else 'red', 'fontWeight': 'bold'})
+
+@app.callback([Output('selected-points-store', 'data', allow_duplicate=True), Output('client-portfolio-status-message', 'children')], Input('update-client-portfolio-btn', 'n_clicks'), [State({'type': 'client-alloc-input', 'index': ALL}, 'value'), State('selected-points-store', 'data')], prevent_initial_call=True)
+def update_client_portfolio(n, allocs, store):
+    if not allocs: return dash.no_update, dash.no_update
+    vals = [float(a) if a else 0 for a in allocs]
+    if not math.isclose(sum(vals), 100.0): return dash.no_update, "Total must be 100%"
+    num_assets = len(assets)
+    yld = sum(vals[i] * BASE_ASSET_CHARACTERISTICS[assets[i]]['yield_bps'] for i in range(num_assets)) / 100
+    drw = sum(vals[i] * BASE_ASSET_CHARACTERISTICS[assets[i]]['drawdown_bps'] for i in range(num_assets)) / 100
+    score = sum(vals[i] * BASE_ASSET_CHARACTERISTICS[assets[i]]['rating_score']/100 for i in range(num_assets))
+    priv = sum(vals[i] for i in range(num_assets) if BASE_ASSET_CHARACTERISTICS[assets[i]]['is_private'])
+    rat = score_to_rating(score)
+    pt = (0, round(yld), rat, round(priv, 2), final_grouped_rating_color_map_v45.get(rat, AEON_GREY), [round(v, 2) for v in vals], round(drw))
+    d = ensure_dict_format(store)
+    d["Current"] = make_tuple_hashable(pt)
+    return d, html.Span(f"Updated: Yld {yld:.0f}bps, Rating {rat}", style={'color': 'green'})
+
+@app.callback([Output('selected-points-store', 'data', allow_duplicate=True), Output('active-reassign-slot-store', 'data')], Input('allocation-graph', 'clickData'), [State('selected-points-store', 'data'), State('active-reassign-slot-store', 'data')], prevent_initial_call=True)
+def handle_scatter_click(clickData, store, active_slot):
+    if not clickData: return dash.no_update, dash.no_update
+    pt = clickData['points'][0].get('customdata')
+    if not pt: return dash.no_update, dash.no_update
+    pt_hash = make_tuple_hashable(tuple(pt))
+    d = ensure_dict_format(store)
+    if active_slot:
+        d[active_slot] = pt_hash
+        return d, None
+    else:
+        for k, v in d.items():
+            if v == pt_hash: return dash.no_update, k 
+        return dash.no_update, dash.no_update
+
+@app.callback(Output('sidebar-comparison-table-div', 'children'), Input('selected-points-store', 'data'))
+def update_table(store):
+    d = ensure_dict_format(store)
+    active = [k for k in slot_keys if d[k]]
+    if not active: return html.P("No points selected.")
+    rows = [html.Tr([html.Th("Metric")] + [html.Th(k) for k in active])]
+    metrics = [("Yield", 1, "{:.0f}bps", 1), ("Drawdown", 6, "{:.0f}bps", 1), ("Rating", 2, "{}", 1), ("Private", 3, "{:.0f}%", 1)]
+    for m in metrics:
+        cells = [html.Td(m[0], style={'fontWeight':'bold'})]
+        for k in active: cells.append(html.Td(m[2].format(d[k][m[1]])))
+        rows.append(html.Tr(cells))
+    return html.Table(rows, style={'width': '100%', 'textAlign': 'center'})
+
+# v1.2 Populate Composition View
+@app.callback(Output('composition-container', 'children'), Input('selected-points-store', 'data'))
+def update_composition_view(store):
+    d = ensure_dict_format(store)
+    
+    tables = []
+    
+    for key in slot_keys:
+        pt = d.get(key)
+        allocs = pt[5] if pt else None
+        
+        table_html = html.Div([
+            html.H3(key, style={'textAlign': 'center', 'color': AEON_DARK_BLUE, 'borderBottom': f'2px solid {AEON_LIGHT_BLUE}'}),
+            html.Div(generate_portfolio_composition_table(key, allocs), style={'overflowY': 'auto', 'height': '75vh'})
+        ], style={'width': '32%', 'backgroundColor': 'white', 'padding': '10px', 'borderRadius': '5px', 'boxShadow': '0 2px 5px rgba(0,0,0,0.1)'})
+        
+        tables.append(table_html)
+        
+    return tables
+
+@app.callback([Output(f'comparison-column-{c["id"]}', 'children') for c in NEW_COLUMN_CONFIG], Input('selected-points-store', 'data'))
+def update_charts(store):
+    d = ensure_dict_format(store)
+    outs = [[] for _ in NEW_COLUMN_CONFIG]
+    for k in slot_keys:
+        pt = d.get(k)
+        allocs = pt[5] if pt else [0]*len(assets)
+        for i, conf in enumerate(NEW_COLUMN_CONFIG):
+            labels, values, colors = [], [], []
+            
+            dynamic_title = conf['title'] 
+            if pt:
+                if conf['id'] == 'asset_allocation': dynamic_title = "100%"
+                elif conf['id'] == 'yield_grouping': dynamic_title = f"{int(pt[1])}bps"
+                elif conf['id'] == 'drawdown_grouping': dynamic_title = f"{int(pt[6])}bps"
+                elif conf['id'] == 'private_public': dynamic_title = f"{int(pt[3])}%"
+                elif conf['id'] == 'rating_grouping': dynamic_title = f"{pt[2]}"
+
+            if pt:
+                if conf['type'] == 'asset_class_pie':
+                    class_totals = {cls: 0.0 for cls in unique_asset_classes}
+                    for idx, asset_name in enumerate(assets):
+                          cls_name = BASE_ASSET_CHARACTERISTICS[asset_name]['asset_class']
+                          class_totals[cls_name] += allocs[idx]
+                    labels = [k for k, v in class_totals.items() if v > 0.01]
+                    values = [v for k, v in class_totals.items() if v > 0.01]
+                    colors = px.colors.qualitative.Prism[:len(labels)] if labels else []
+
+                elif conf['type'] == 'pie':
+                    labels, values = assets, allocs
+                    colors = [final_grouped_rating_color_map_v45.get(score_to_rating(BASE_ASSET_CHARACTERISTICS[ac]['rating_score']), AEON_GREY) for ac in assets]
+                elif conf['type'] == 'grouped_pie':
+                    key = conf['metric_char_key']
+                    for j, r in enumerate(conf['ranges']):
+                        val = sum(allocs[x] for x in range(len(assets)) if r[0] <= BASE_ASSET_CHARACTERISTICS[assets[x]][key] < (r[1] or 99999))
+                        if val > 0: labels.append(r[2]); values.append(val); colors.append(conf['colors'][j])
+                elif conf['breakdown_type'] == 'private_public':
+                    priv = sum(allocs[x] for x in range(len(assets)) if BASE_ASSET_CHARACTERISTICS[assets[x]]['is_private'])
+                    pub = 100 - priv
+                    if priv>0: labels.append("Private"); values.append(priv); colors.append(PRIVATE_PUBLIC_COLORS["Private Assets"])
+                    if pub>0: labels.append("Public"); values.append(pub); colors.append(PRIVATE_PUBLIC_COLORS["Public Assets"])
+                elif conf['breakdown_type'] == 'rating_group':
+                    for grp, col in RATING_GROUP_COLORS.items():
+                        val = sum(allocs[x] for x in range(len(assets)) if get_rating_group(score_to_rating(BASE_ASSET_CHARACTERISTICS[assets[x]]['rating_score'])) == grp)
+                        if val>0: labels.append(grp); values.append(val); colors.append(col)
+            
+            outs[i].append(html.Div([dcc.Graph(figure=create_pie_figure(labels, values, colors, dynamic_title, 300), config={'displayModeBar': False})]))
+    return tuple(outs)
+
+@app.callback(Output('allocation-graph','figure'), [Input('covid-limit-range-slider','value'), Input('private-limit-range-slider','value'), Input('yield-range-slider','value'), Input('rating-filter','value'), Input('is-3d-view-store','data'), Input('selected-points-store','data'), Input('main-data-store', 'data')])
+def update_main_graph(cov_r, priv_r, yld_r, rats, is_3d, sel_store, data_points):
+    if not data_points: return go.Figure(layout=go.Layout(title="Calculating..."))
+    df = pd.DataFrame(data_points)
+    df = df[df['covid_limit'].between(cov_r[0], cov_r[1])]
+    df = df[df['private_limit'].between(priv_r[0], priv_r[1])]
+    df = df[df['total_yield_bps'].between(yld_r[0], yld_r[1])]
+    if rats: df = df[df['rating_str'].isin(rats)]
+    
+    traces = []
+    x_vals, y_vals, z_vals = [], [], []
+    
+    # 1. Cloud Points
+    if not df.empty:
+        x_vals.extend(df['actual_covid_drawdown'].tolist())
+        if is_3d:
+             y_vals.extend(df['private_limit'].tolist())
+             z_vals.extend(df['total_yield_bps'].tolist())
+        else:
+             y_vals.extend(df['total_yield_bps'].tolist())
+             
+        for rat in CANONICAL_RATING_ORDER:
+            dfr = df[df['rating_str'] == rat]
+            if dfr.empty: continue
+            if not is_3d:
+                traces.append(go.Scattergl(
+                    x=dfr['actual_covid_drawdown'], y=dfr['total_yield_bps'], mode='markers', name=rat,
+                    marker=dict(size=6, color=final_grouped_rating_color_map_v45.get(rat, AEON_GREY), opacity=0.6),
+                    customdata=[make_tuple_hashable(tuple(x)) for x in dfr[DEFAULT_COLUMNS].values],
+                    hovertemplate="Yield: %{y:.0f}bps<br>Drawdown: %{x:.0f}bps<extra></extra>"
+                ))
+            else:
+                traces.append(go.Scatter3d(
+                    x=dfr['actual_covid_drawdown'], y=dfr['private_limit'], z=dfr['total_yield_bps'],
+                    mode='markers', name=rat,
+                    marker=dict(size=4, color=final_grouped_rating_color_map_v45.get(rat, AEON_GREY), opacity=0.6),
+                    customdata=[make_tuple_hashable(tuple(x)) for x in dfr[DEFAULT_COLUMNS].values],
+                    hovertemplate="Yield: %{z:.0f}bps<br>Drawdown: %{x:.0f}bps<br>Private: %{y:.0f}%<extra></extra>"
+                ))
+    
+    # 2. Selected Points
+    sel_d = ensure_dict_format(sel_store)
+    for k, v in sel_d.items():
+        if v:
+            x_vals.append(v[6]) 
+            if is_3d:
+                y_vals.append(v[3])
+                z_vals.append(v[1])
+            else:
+                y_vals.append(v[1])
+            
+            if not is_3d:
+                traces.append(go.Scatter(x=[v[6]], y=[v[1]], mode='markers+text', text=[k], textposition='top center', marker=dict(size=15, color='lime' if k=="Current" else 'orange', line=dict(width=2, color='black')), name=k))
+            else:
+                traces.append(go.Scatter3d(x=[v[6]], y=[v[3]], z=[v[1]], mode='markers+text', text=[k], marker=dict(size=10, color='lime' if k=="Current" else 'orange'), name=k))
+
+    # 3. Dynamic Axes
+    def calc_range(values, default_range):
+        if not values: return default_range
+        v_min, v_max = min(values), max(values)
+        if v_min == v_max: return [max(0, v_min - 10), v_max + 10]
+        padding = (v_max - v_min) * 0.05
+        return [max(0, v_min - padding), v_max + padding]
+
+    final_x_range = calc_range(x_vals, [0, 1200])
+    
+    if is_3d:
+        final_y_range = calc_range(y_vals, [0, 100])
+        final_z_range = calc_range(z_vals, [0, 1200])
+    else:
+        final_y_range = calc_range(y_vals, [0, 1200])
+
+    fig = go.Figure(data=traces)
+    
+    if not is_3d:
+        fig.update_layout(template="plotly_white", xaxis_title="Drawdown (bps)", yaxis_title="Yield (bps)", xaxis_range=final_x_range, yaxis_range=final_y_range, margin=dict(l=40, r=40, t=40, b=40))
+    else: 
+        fig.update_layout(uirevision="constant", scene=dict(
+                xaxis=dict(title="Drawdown", range=final_x_range, autorange=False),
+                yaxis=dict(title="Private %", range=final_y_range, autorange=False),
+                zaxis=dict(title="Yield", range=final_z_range, autorange=False),
+                camera=dict(eye=dict(x=-2.5, y=-2.5, z=1.5))))
+        
+    return fig
+
+@app.callback(Output('alm-graph', 'figure'), Input('selected-points-store', 'data'))
+def update_alm_graph(store):
+    d = ensure_dict_format(store)
+    fig = go.Figure()
+    
+    # 1. Target Curve
+    target_x = [p['Year'] for p in alm_profile]
+    target_y = [p['Liabilities'] for p in alm_profile]
+    
+    # 2. Funnel (Upper/Lower)
+    upper = [y * 1.1 for y in target_y]
+    lower = [y * 0.9 for y in target_y]
+    
+    # Add Funnel Trace
+    fig.add_trace(go.Scatter(
+        x=target_x + target_x[::-1],
+        y=upper + lower[::-1],
+        fill='toself',
+        fillcolor='rgba(200, 200, 200, 0.4)',
+        line=dict(color='rgba(255,255,255,0)'),
+        name='Target +/- 10%'
+    ))
+    
+    # Add Target Line
+    fig.add_trace(go.Scatter(x=target_x, y=target_y, mode='lines', line=dict(color='black', dash='dash'), name='Target Liability'))
+    
+    # 3. Selected Portfolios
+    colors = {'Current': 'lime', 'Switch 1': 'orange', 'Switch 2': 'orange'}
+    for k, v in d.items():
+        if v:
+            allocs = v[5]
+            px_val, py_val = calculate_portfolio_alm_curve(allocs)
+            
+            is_good = True
+            for i, y_actual in enumerate(py_val):
+                t_idx = target_x.index(px_val[i]) if px_val[i] in target_x else -1
+                if t_idx >= 0:
+                    if not (lower[t_idx] - 0.1 <= y_actual <= upper[t_idx] + 0.1): 
+                        is_good = False
+            
+            status_icon = "✅" if is_good else "❌"
+            
+            fig.add_trace(go.Scatter(
+                x=px_val, y=py_val, mode='lines+markers',
+                line=dict(color=colors[k], width=3),
+                marker=dict(size=6),
+                name=f"{k} {status_icon}"
+            ))
+
+    fig.update_layout(
+        title="Portfolio Asset Survival vs. Liability Run-off",
+        xaxis_title="Year",
+        yaxis_title="% Remaining / Invested",
+        template="plotly_white",
+        hovermode="x unified"
+    )
+    return fig
+
+def find_free_port():
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(('', 0))
+        return s.getsockname()[1]
+
+if __name__ == '__main__':
+    port = find_free_port()
+    print(f"Starting Dash v1.2 on http://127.0.0.1:{port}")
+    app.run(host='127.0.0.1', port=port, debug=True, use_reloader=False)
+
